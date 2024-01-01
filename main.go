@@ -177,3 +177,4 @@ func jobNew(ctx context.Context, args ...interface{}) (interface{}, error) {
    // ตั้งค่า Subscriber สำหรับ jobNew ถ้ามี
    jobSubscribers["jobNew"] = []string{"job1", "job2"} // ตัวอย่าง: ให้ job1 และ job2 ทำงานหลังจาก jobNew
 */
+//..
