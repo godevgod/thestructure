@@ -20,5 +20,6 @@ Key Points to Avoid Deadlock
 Careful use of Goroutines and Channels.
 Managing the size and capacity of Channels.
 Using Select for channel communication in certain scenarios.
+####
 This project development of a framework for Pub/Sub work in Golang, offering flexibility in handling job functions and communication between different jobs.
 ####
