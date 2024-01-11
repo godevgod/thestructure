@@ -1,180 +1,228 @@
-//main.go golang code
-
 package main
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/signal"
-	"sync"
+	"reflect"
 	"syscall"
 	"time"
 )
 
-type Job func(ctx context.Context, args ...interface{}) (result interface{}, err error)
+// JobFunc represents a generic job function.
+type JobFunc interface{}
 
-var (
-	jobs           = make(map[string]Job)
-	jobStatuses    = make(map[string]*JobStatus)
-	jobSubscribers = make(map[string][]string)
-	mu             sync.Mutex // To handle concurrency
-)
-
-type JobStatus struct {
-	Running   bool
-	StartTime time.Time
-	EndTime   time.Time
+// JobResult represents the result of a job along with its metadata.
+type JobResult struct {
+	Result  interface{} // The actual result of the job.
+	JobName string      // Name of the job.
+	Client  string      // Identifier of the client that started the job.
 }
 
-func initializeJobStatuses(jobNames []string) {
-	for _, name := range jobNames {
-		jobStatuses[name] = &JobStatus{Running: false}
+// JobManager manages job functions and subscriptions.
+type JobManager struct {
+	jobs        map[string]JobFunc
+	subscribers map[string][]string // Maps a job to its subscribers
+	resultCh    chan JobResult      // Channel for job results.
+}
+
+// NewJobManager creates a new JobManager with a result channel.
+func NewJobManager() *JobManager {
+	return &JobManager{
+		jobs:        make(map[string]JobFunc),
+		subscribers: make(map[string][]string),
+		resultCh:    make(chan JobResult),
 	}
 }
 
-func startJobByName(jobName string, args ...interface{}) {
-	mu.Lock()
-	defer mu.Unlock()
+// RegisterJob registers a job with the given name and function.
+func (jm *JobManager) RegisterJob(name string, job JobFunc) {
+	jm.jobs[name] = job
+}
 
-	jobFunc, exists := jobs[jobName]
+// SubscribeJob sets a subscription from one job to another.
+func (jm *JobManager) SubscribeJob(publisher, subscriber string) {
+	jm.subscribers[publisher] = append(jm.subscribers[publisher], subscriber)
+}
+
+func (jm *JobManager) StartJob(jobName string, client string, args ...interface{}) {
+	jobFunc, exists := jm.jobs[jobName]
 	if !exists {
 		fmt.Printf("Job %s does not exist.\n", jobName)
 		return
 	}
 
-	if jobStatuses[jobName].Running {
-		fmt.Printf("Job %s is already running.\n", jobName)
-		return
-	}
+	go func() {
+		reflectJobFunc := reflect.ValueOf(jobFunc)
+		funcType := reflectJobFunc.Type()
 
-	// สร้าง context ที่ไม่มีการยกเลิกหรือ timeout
-	ctx := context.Background()
+		var callArgs []reflect.Value
 
-	//go executeJob(jobName, jobFunc, args...)
-	go executeJob(ctx, jobName, jobFunc, args...)
+		for i := 0; i < funcType.NumIn(); i++ {
+			if i < len(args) {
+				argValue := reflect.ValueOf(args[i])
+				if argValue.IsValid() && argValue.Type().ConvertibleTo(funcType.In(i)) {
+					callArgs = append(callArgs, argValue.Convert(funcType.In(i)))
+				} else {
+					callArgs = append(callArgs, reflect.Zero(funcType.In(i)))
+				}
+			} else {
+				callArgs = append(callArgs, reflect.Zero(funcType.In(i)))
+			}
+		}
+
+		results := reflectJobFunc.Call(callArgs)
+		if len(results) > 0 {
+			for _, result := range results {
+				jm.resultCh <- JobResult{
+					Result:  result.Interface(),
+					JobName: jobName,
+					Client:  client,
+				}
+			}
+		} else {
+			jm.resultCh <- JobResult{
+				Result:  nil,
+				JobName: jobName,
+				Client:  client,
+			}
+		}
+	}()
 }
 
-func executeJob(ctx context.Context, name string, jobFunc Job, args ...interface{}) {
-	fmt.Printf("Starting job %s.\n", name)
-	jobStatuses[name].Running = true
-	jobStatuses[name].StartTime = time.Now()
-
-	// ทำงานของ job
-	result, err := jobFunc(ctx, args...)
-
-	jobStatuses[name].Running = false
-	jobStatuses[name].EndTime = time.Now()
-
-	if err != nil {
-		fmt.Printf("Error in job %s: %v\n", name, err)
-		return
+func (jm *JobManager) NotifySubscribersWithDelay(jobName string, client string, result interface{}, delaySec int) {
+	if delaySec > 0 {
+		time.Sleep(time.Duration(delaySec) * time.Second)
 	}
-
-	fmt.Printf("Job %s completed with result: %v\n", name, result)
-
-	// Notify subscribers
-	notifySubscribers(name, result)
+	jm.notifySubscribers(jobName, client, result)
 }
 
-func notifySubscribers(jobName string, result interface{}) {
-	for _, subscriber := range jobSubscribers[jobName] {
-		// ส่งข้อมูลเกี่ยวกับงานที่เรียก (jobName) ไปยัง subscriber
-		startJobByName(subscriber, jobName, result)
-	}
-}
-
-func job1(ctx context.Context, args ...interface{}) (interface{}, error) {
-	fmt.Println("Executing job1")
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(3 * time.Second): // Simulate work
-		return "Result from job1", nil
-	}
-}
-
-func job2(ctx context.Context, args ...interface{}) (interface{}, error) {
-	caller := args[0] // ข้อมูลเกี่ยวกับงานที่เรียกใช้งานนี้
-	fmt.Printf("Executing job2, called by %v\n", caller)
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(4 * time.Second): // Simulate work
-		return fmt.Sprintf("Result from job2, time: %v", time.Now().Unix()), nil
+func (jm *JobManager) notifySubscribers(jobName string, client string, result interface{}) {
+	for _, subJob := range jm.subscribers[jobName] {
+		jm.StartJob(subJob, client, result)
 	}
 }
 
-var count int64 = 0 // Global counter for job3
+func (jm *JobManager) ListenForResults() {
+	go func() {
+		for jobResult := range jm.resultCh {
+			fmt.Printf("Client '%s' received result from job '%s': %v\n", jobResult.Client, jobResult.JobName, jobResult.Result)
 
-func job3(ctx context.Context, args ...interface{}) (interface{}, error) {
-	caller := args[0] // ข้อมูลเกี่ยวกับงานที่เรียกใช้งานนี้
-	fmt.Printf("Executing job3, called by %v\n", caller)
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(5 * time.Second): // Simulate work
-		count++ // Increment the counter
-		return fmt.Sprintf("Result from job3, count: %d", count), nil
-	}
+			// Introduce a delay after each job result is processed
+			var delaySec int
+			switch jobResult.JobName {
+			case "jobAAddTwo", "jobBSubtractOne":
+				delaySec = 3 // 3 seconds delay after each job
+			default:
+				delaySec = 0
+			}
+
+			jm.NotifySubscribersWithDelay(jobResult.JobName, jobResult.Client, jobResult.Result, delaySec)
+		}
+	}()
+}
+
+func (jm *JobManager) Delay(seconds int) {
+	time.Sleep(time.Duration(seconds) * time.Second)
+}
+
+// Example job functions
+func exampleJob(a string, b int) string {
+	fmt.Printf("Example Job executing with string: %s, int: %d\n", a, b)
+	return fmt.Sprintf("Processed: %s, %d", a, b)
+}
+
+func noInputReturnsOutput() []interface{} {
+	fmt.Println("Job with no input but returns output")
+	return []interface{}{"Output1", 42}
+}
+
+func inputNoOutput(a string, b int) {
+	jm := NewJobManager()
+	jm.Delay(5) // 5-second delay inside the job
+	fmt.Printf("Job with input '%s', '%d' and no output\n", a, b)
+}
+
+func noInputNoOutput() {
+	fmt.Println("Job with no input and no output")
+}
+
+// jobAAddTwo adds 2 to the input and sends it to jobBSubtractOne.
+func jobAAddTwo(input int) int {
+	result := input + 2
+	fmt.Printf("jobAAddTwo: %d\n", result)
+	return result
+}
+
+// jobBSubtractOne subtracts 1 from the input and sends it back to jobAAddTwo.
+func jobBSubtractOne(input int) int {
+	result := input - 1
+	fmt.Printf("jobBSubtractOne: %d\n", result)
+	return result
 }
 
 func main() {
-	initializeJobStatuses([]string{"job1", "job2", "job3"})
+	jm := NewJobManager()
 
-	jobs["job1"] = job1
-	jobs["job2"] = job2
-	jobs["job3"] = job3
+	//test mode
+	// Register jobs
+	jm.RegisterJob("jobAAddTwo", jobAAddTwo)
+	jm.RegisterJob("jobBSubtractOne", jobBSubtractOne)
 
-	// Setting up subscribers
-	jobSubscribers["job1"] = []string{"job2"}
-	jobSubscribers["job2"] = []string{"job3"}
-	jobSubscribers["job3"] = []string{"job2"}
+	// Define subscriptions
+	jm.SubscribeJob("jobAAddTwo", "jobBSubtractOne")
+	jm.SubscribeJob("jobBSubtractOne", "jobAAddTwo")
 
-	// Start the first job
-	startJobByName("job1")
+	// Define a client identifier
+	client := "client"
+	clientx := "clientx"
 
-	// Keep the application running to observe job execution
+	// Start the loop with an initial value
+	initialInput := 10
+	jm.StartJob("jobAAddTwo", client, initialInput)
+
+	// Delay before starting the loop for 'clientx'
+	delayInSeconds := 5 // Delay for 5 seconds
+	time.Sleep(time.Duration(delayInSeconds) * time.Second)
+
+	initialInputx := 10000
+	jm.StartJob("jobBSubtractOne", clientx, initialInputx)
+
+	// Register jobs
+	// jm.RegisterJob("exampleJob", exampleJob)
+	// jm.RegisterJob("noInputReturnsOutput", noInputReturnsOutput)
+	// jm.RegisterJob("inputNoOutput", inputNoOutput)
+	// jm.RegisterJob("noInputNoOutput", noInputNoOutput)
+
+	//jm.ListenForResults()
+
+	// Define subscriptions
+	// jm.SubscribeJob("exampleJob", "noInputReturnsOutput")
+	// jm.SubscribeJob("noInputReturnsOutput", "inputNoOutput")
+	// jm.SubscribeJob("inputNoOutput", "noInputNoOutput")
+	// jm.SubscribeJob("noInputNoOutput", "inputNoOutput")
+
+	// // Define client identifiers
+	// client1 := "client1"
+	// client2 := "client2"
+	// client3 := "client3"
+	// client4 := "client4"
+
+	// // Start jobs with client identifiers
+	// jm.StartJob("exampleJob", client1, "Hello", 123)
+	// jm.StartJob("noInputReturnsOutput", client2)
+	// jm.StartJob("inputNoOutput", client3, "Test", 100)
+	// jm.StartJob("noInputNoOutput", client4)
+
+	jm.ListenForResults()
+
+	// Handle graceful termination
 	gracefulTermination()
-	//	for {
-	//time.Sleep(9000 * time.Second)
-	//	}
 }
 
-// gracefulTermination handles the graceful termination of the program
 func gracefulTermination() {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// Block until a signal is received.
 	<-sigChan
-
-	// Perform cleanup here if needed
-
 	fmt.Println("Program exiting gracefully")
 }
-
-/*
-// jobNew คือฟังก์ชันงานใหม่ที่คุณต้องการเพิ่ม
-func jobNew(ctx context.Context, args ...interface{}) (interface{}, error) {
-	// ตรงนี้ใส่โค้ดของงานใหม่ที่คุณต้องการ
-	// ตัวอย่าง: ใช้เวลาในการทำงานและส่งคืนค่าผลลัพธ์
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(2 * time.Second): // Simulate work
-		return "Result from jobNew", nil
-	}
-}
-
-
-   // เพิ่มสถานะของงานใหม่
-   initializeJobStatuses([]string{"job1", "job2", "job3", "jobNew"}) // เพิ่ม "jobNew"
-
-   // ลงทะเบียนงานใหม่
-   jobs["jobNew"] = jobNew
-
-   // ตั้งค่า Subscriber สำหรับ jobNew ถ้ามี
-   jobSubscribers["jobNew"] = []string{"job1", "job2"} // ตัวอย่าง: ให้ job1 และ job2 ทำงานหลังจาก jobNew
-*/
-//..
